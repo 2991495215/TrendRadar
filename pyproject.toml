@@ -4,16 +4,20 @@ version = "6.11.0"
 description = "TrendRadar - 热点新闻聚合与分析工具"
 requires-python = ">=3.12"
 dependencies = [
-    "requests==2.33.0",
-    "pytz==2026.1",
+    "requests==2.34.2",
+    "pytz==2026.6",
     "PyYAML==6.0.3",
-    "fastmcp==2.12.5",
-    "websockets==13.1",
-    "feedparser==6.0.12",
-    "boto3==1.42.76",
-    "litellm==1.82.6",
-    "json-repair==0.58.6",
-    "tenacity==8.5.0",
+    "fastmcp==4.1.5",
+    "websockets==17.4",
+    "authlib==1.9.2",
+    "anyio==4.16.0",
+    "feedparser==6.0.14",
+    "boto3==1.43.123",
+    "litellm==1.106.6",
+    "json-repair>=0.60.1",
+    "tenacity==9.2.1",
+    "urllib3>=2.8.0",
+    "starlette>=1.7.0",
 ]
 
 [project.scripts]
