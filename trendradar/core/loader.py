@@ -419,6 +419,8 @@ def _load_webhook_config(config_data: Dict) -> Dict:
         # Telegram
         "TELEGRAM_BOT_TOKEN": _get_env_str("TELEGRAM_BOT_TOKEN") or telegram.get("bot_token", ""),
         "TELEGRAM_CHAT_ID": _get_env_str("TELEGRAM_CHAT_ID") or telegram.get("chat_id", ""),
+        "TELEGRAM_FULL_BOT_TOKEN": _get_env_str("TELEGRAM_FULL_BOT_TOKEN"),
+        "TELEGRAM_FULL_CHAT_ID": _get_env_str("TELEGRAM_FULL_CHAT_ID"),
         # 邮件
         "EMAIL_FROM": _get_env_str("EMAIL_FROM") or email.get("from", ""),
         "EMAIL_PASSWORD": _get_env_str("EMAIL_PASSWORD") or email.get("password", ""),
@@ -571,7 +573,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
 
     # 平台配置
     platforms_config = config_data.get("platforms", {})
-    config["PLATFORMS"] = [p for p in platforms_config.get("sources", []) if p.get("enabled", True)]
+    config["PLATFORMS"] = [p for p in platforms_config.get("sources", []) if p.get("enabled", True)] if config["ENABLE_CRAWLER"] else []
 
     # RSS 配置
     config["RSS"] = _load_rss_config(config_data)

@@ -5,9 +5,12 @@ RSS 抓取器
 负责从配置的 RSS 源抓取数据并转换为标准格式
 """
 
+import json
+import os
 import time
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 import requests
@@ -66,6 +69,41 @@ class RSSFetcher:
 
         self.parser = RSSParser()
         self.session = self._create_session()
+        self.cache_dir = Path(os.getenv("TREND_RADAR_RSS_CACHE_DIR", "/app/output/rss-cache"))
+        self.cache_max_age = int(os.getenv("TREND_RADAR_RSS_CACHE_MAX_AGE", "900"))
+
+    def _load_cached_items(self, feed: RSSFeedConfig) -> Optional[List[RSSItem]]:
+        if not feed.id or Path(feed.id).name != feed.id:
+            return None
+        path = self.cache_dir / f"{feed.id}.json"
+        try:
+            if time.time() - path.stat().st_mtime > self.cache_max_age:
+                return None
+            rows = json.loads(path.read_text(encoding="utf-8"))
+            now = get_configured_time(self.timezone)
+            crawl_time = now.strftime("%H:%M")
+            items = [
+                RSSItem(
+                    title=row.get("title", ""),
+                    feed_id=feed.id,
+                    feed_name=feed.name,
+                    url=row.get("url", ""),
+                    guid=row.get("guid", ""),
+                    published_at=row.get("published_at", ""),
+                    summary=row.get("summary", ""),
+                    author=row.get("author", ""),
+                    crawl_time=crawl_time,
+                    first_time=crawl_time,
+                    last_time=crawl_time,
+                    count=1,
+                )
+                for row in rows
+                if row.get("title") and row.get("url")
+            ]
+            print(f"[RSS] {feed.name}: 使用共享缓存 {len(items)} 条")
+            return items
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
 
     def _create_session(self) -> requests.Session:
         """创建请求会话"""
@@ -84,41 +122,51 @@ class RSSFetcher:
 
         return session
 
-    def fetch_feed(self, feed: RSSFeedConfig) -> Tuple[List[RSSItem], Optional[str]]:
+    def fetch_feed(self, feed: RSSFeedConfig, *, use_cache: bool = True) -> Tuple[List[RSSItem], Optional[str]]:
         """
         抓取单个 RSS 源
 
         Args:
             feed: RSS 源配置
+            use_cache: 是否读取共享缓存；缓存生产者必须关闭，避免重复读取旧数据
 
         Returns:
             (条目列表, 错误信息) 元组
         """
         try:
-            # 瞬时请求故障只额外尝试一次，不增加等待。
-            for attempt in range(2):
-                try:
-                    response = self.session.get(feed.url, timeout=self.timeout)
-                    response.raise_for_status()
-                    break
-                except requests.RequestException as e:
-                    error_response = e.response
-                    retryable = isinstance(e, (requests.Timeout, requests.ConnectionError)) and not isinstance(
-                        e, requests.exceptions.SSLError
-                    )
-                    if isinstance(e, requests.HTTPError):
-                        retryable = error_response is not None and error_response.status_code in {
-                            408, 500, 502, 503, 504
-                        }
-                    # 不提前重试带服务端等待指令的失败响应。
-                    if (
-                        not retryable
-                        or attempt == 1
-                        or (error_response is not None and "Retry-After" in error_response.headers)
-                    ):
-                        raise
-
-            parsed_items = self.parser.parse(response.text, feed.url)
+            cached_items = self._load_cached_items(feed) if use_cache else None
+            if cached_items is not None:
+                return cached_items, None
+            try:
+                headers = None
+                if "reddit.com/" in feed.url:
+                    headers = {"User-Agent": "Mozilla/5.0 (compatible; Horizon/1.0)"}
+                for attempt in range(2):
+                    try:
+                        response = self.session.get(feed.url, timeout=self.timeout, headers=headers)
+                        response.raise_for_status()
+                        break
+                    except requests.RequestException as e:
+                        error_response = e.response
+                        retryable = isinstance(e, (requests.Timeout, requests.ConnectionError)) and not isinstance(
+                            e, requests.exceptions.SSLError
+                        )
+                        if isinstance(e, requests.HTTPError):
+                            retryable = error_response is not None and error_response.status_code in {
+                                408, 500, 502, 503, 504
+                            }
+                        if (
+                            not retryable
+                            or attempt == 1
+                            or (error_response is not None and "Retry-After" in error_response.headers)
+                        ):
+                            raise
+                parsed_items = self.parser.parse(response.text, feed.url)
+            except requests.RequestException as e:
+                # Respect server backoff even when the curl fallback is available.
+                if e.response is not None and "Retry-After" in e.response.headers:
+                    raise
+                parsed_items = self.parser.parse_url(feed.url, self.timeout)
 
             # 限制条目数量（0=不限制）
             if feed.max_items > 0:

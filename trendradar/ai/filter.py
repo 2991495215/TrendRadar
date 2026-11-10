@@ -9,6 +9,7 @@ AI 智能筛选模块
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -317,12 +318,13 @@ class AIFilter:
         阶段 B：对一批新闻标题做分类
 
         Args:
-            titles: [{"id": news_item_id, "title": str, "source": str}]
+            titles: [{"id": news_item_id, "title": str, "source": str,
+                      "summary": str, "url": str, "author": str}]
             tags: [{"id": tag_id, "tag": str, "description": str}]
             interests_content: 用户的兴趣描述（含质量过滤要求）
 
         Returns:
-            成功返回 [{"news_item_id": int, "tag_id": int, "relevance_score": float}, ...]（无匹配时为空列表）；
+            成功返回全部输入的明确评分及 reason；遗漏结果视为失败，不伪造零分。
             调用失败返回 None（用于区分"无匹配"与"调用失败"，失败批次不标记已分析以便下次重试）
         """
         if not titles or not tags:
@@ -339,10 +341,20 @@ class AIFilter:
         )
 
         # 构建新闻列表文本
-        news_list = "\n".join(
-            f"{t['id']}. [{t.get('source', '')}] {t['title']}"
-            for t in titles
-        )
+        news_blocks = []
+        for t in titles:
+            block = [
+                f"{t['id']}. [{t.get('source', '')}]",
+                f"标题：{t['title']}",
+            ]
+            if t.get("author"):
+                block.append(f"作者：{t['author']}")
+            if t.get("summary"):
+                block.append(f"正文摘要：{t['summary']}")
+            if t.get("url"):
+                block.append(f"链接：{t['url']}")
+            news_blocks.append("\n".join(block))
+        news_list = "\n\n".join(news_blocks)
 
         # 填充模板
         user_prompt = self.classify_user
@@ -401,7 +413,7 @@ class AIFilter:
         if not json_str:
             if self.debug:
                 print(f"[AI筛选][DEBUG] 无法从分类响应中提取 JSON，原始响应前 500 字符: {(response or '')[:500]}")
-            return []
+            raise ValueError("分类响应没有有效 JSON")
 
         try:
             data = json.loads(json_str)
@@ -409,12 +421,12 @@ class AIFilter:
             if self.debug:
                 print(f"[AI筛选][DEBUG] 分类响应 JSON 解析失败: {e}")
                 print(f"[AI筛选][DEBUG] 提取的 JSON 文本前 500 字符: {json_str[:500]}")
-            return []
+            raise ValueError("分类响应 JSON 解析失败") from e
 
         if not isinstance(data, list):
             if self.debug:
                 print(f"[AI筛选][DEBUG] 分类响应顶层不是数组，实际类型: {type(data).__name__}")
-            return []
+            raise ValueError("分类响应必须是 JSON 数组")
 
         # 构建 id 映射
         title_ids = {t["id"] for t in titles}
@@ -427,21 +439,27 @@ class AIFilter:
         skipped_news_ids = 0
         skipped_tag_ids = 0
         skipped_empty = 0
+        returned_ids = set()
 
         for item in data:
             if not isinstance(item, dict):
-                continue
+                raise ValueError("分类数组条目必须是对象")
             news_id = item.get("id")
             if news_id not in title_ids:
-                skipped_news_ids += 1
-                continue
+                raise ValueError("分类响应包含未知新闻 ID")
+            if news_id in returned_ids:
+                raise ValueError("分类响应包含重复新闻 ID")
+            returned_ids.add(news_id)
+            reason = item.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("分类响应缺少评分依据")
 
             # 收集此条新闻的所有候选 tag
             candidates = []
 
             if "tag_id" in item:
                 # 新格式（扁平）: {"id": 1, "tag_id": 1, "score": 0.9}
-                candidates.append({"tag_id": item["tag_id"], "score": item.get("score", 0.5)})
+                candidates.append({"tag_id": item["tag_id"], "score": item.get("score")})
             elif "tags" in item:
                 # 旧格式（嵌套）: {"id": 1, "tags": [{"tag_id": 1, "score": 0.9}]}
                 matched_tags = item.get("tags", [])
@@ -464,15 +482,19 @@ class AIFilter:
                     continue
                 tag_id = tag_match.get("tag_id")
                 if tag_id not in tag_id_set:
-                    skipped_tag_ids += 1
-                    continue
+                    raise ValueError("分类响应包含未知标签 ID")
 
-                score = tag_match.get("score", 0.5)
+                score = tag_match.get("score")
+                if isinstance(score, bool):
+                    raise ValueError("分类评分不能是布尔值")
                 try:
                     score = float(score)
-                    score = max(0.0, min(1.0, score))
+                    if not math.isfinite(score):
+                        raise ValueError("分类评分必须是有限数值")
+                    if not 0 <= score <= 1:
+                        raise ValueError("分类评分必须在 0~1 范围")
                 except (ValueError, TypeError):
-                    score = 0.5
+                    raise ValueError("分类评分必须是有效数值")
 
                 if score > best_score:
                     best_score = score
@@ -486,9 +508,12 @@ class AIFilter:
                         "news_item_id": news_id,
                         "tag_id": best_tag_id,
                         "relevance_score": best_score,
+                        "reason": reason.strip(),
                     }
 
         results = list(best_per_news.values())
+        if set(best_per_news) != title_ids:
+            raise ValueError("分类响应未覆盖全部输入，保留待重试")
 
         if self.debug:
             ai_returned = len(data)

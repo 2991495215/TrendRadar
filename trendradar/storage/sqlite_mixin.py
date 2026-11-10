@@ -1740,13 +1740,14 @@ class SQLiteStorageMixin:
             return []
 
     def _get_all_rss_ids_impl(self, date: Optional[str] = None) -> List[Dict]:
-        """获取当日所有 RSS 条目的 id 和标题（用于 AI 筛选分类）"""
+        """获取当日所有 RSS 条目及分类所需上下文（用于 AI 筛选分类）"""
         try:
             conn = self._get_connection(date, db_type="rss")
             cursor = conn.cursor()
 
             cursor.execute("""
-                SELECT i.id, i.title, i.feed_id, f.name as feed_name, i.published_at
+                SELECT i.id, i.title, i.feed_id, f.name as feed_name, i.published_at,
+                       i.summary, i.url, i.author
                 FROM rss_items i
                 LEFT JOIN rss_feeds f ON i.feed_id = f.id
                 ORDER BY i.id
@@ -1757,6 +1758,9 @@ class SQLiteStorageMixin:
                     "id": row[0], "title": row[1],
                     "source_id": row[2], "source_name": row[3] or row[2],
                     "published_at": row[4] or "",
+                    "summary": row[5] or "",
+                    "url": row[6] or "",
+                    "author": row[7] or "",
                 }
                 for row in cursor.fetchall()
             ]

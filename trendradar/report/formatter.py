@@ -134,23 +134,36 @@ def format_title_for_platform(
         if link_url:
             formatted_title = f'<a href="{link_url}">{html_escape(cleaned_title)}</a>'
         else:
-            formatted_title = cleaned_title
+            formatted_title = html_escape(cleaned_title)
 
-        title_prefix = "🆕 " if title_data.get("is_new") else ""
+        source = title_data.get("source_name", "")
+        source_map = {
+            "X｜正在关注": "X · 关注",
+            "X｜为你推荐": "X · 推荐",
+        }
+        source = source_map.get(source, source)
+        if source.startswith("YouTube｜"):
+            source = "YouTube · " + source.removeprefix("YouTube｜")
+        elif source.startswith("Telegram｜"):
+            source = "Telegram · " + source.removeprefix("Telegram｜")
 
-        if show_source:
-            result = f"[{title_data['source_name']}] {title_prefix}{formatted_title}"
+        if show_source and source:
+            result = f"<b>{html_escape(source)}</b>\n{formatted_title}"
         elif show_keyword and keyword:
-            result = f"<b>[{html_escape(keyword)}]</b> {title_prefix}{formatted_title}"
+            result = f"<b>{html_escape(keyword)}</b>\n{formatted_title}"
         else:
-            result = f"{title_prefix}{formatted_title}"
+            result = formatted_title
 
         if rank_display:
             result += f" {rank_display}"
+
+        meta = []
         if title_data["time_display"]:
-            result += f" <code>- {title_data['time_display']}</code>"
+            meta.append(title_data["time_display"])
         if title_data["count"] > 1:
-            result += f" <code>({title_data['count']}次)</code>"
+            meta.append(f"{title_data['count']}次")
+        if meta:
+            result += f"\n<code>{' · '.join(meta)}</code>"
 
         return result
 

@@ -102,6 +102,8 @@ class AIClient:
 
         # 调用 LiteLLM
         response = completion(**params)
+        if response.choices[0].finish_reason == "length":
+            raise ValueError("AI 响应被 token 上限截断，请提高 max_tokens")
 
         # 提取响应内容
         # 某些模型/提供商返回 list（内容块）而非 str，统一转为 str
@@ -111,7 +113,9 @@ class AIClient:
                 item.get("text", str(item)) if isinstance(item, dict) else str(item)
                 for item in content
             )
-        return content or ""
+        if not content or not content.strip():
+            raise ValueError("AI 返回空正文，不能视为有效评分")
+        return content
 
     def validate_config(self) -> tuple[bool, str]:
         """

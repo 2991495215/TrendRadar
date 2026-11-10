@@ -19,7 +19,7 @@ class AIExtraParamsTests(unittest.TestCase):
         self.addCleanup(env_patch.stop)
 
         response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="mocked reply"))]
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="mocked reply"))]
         )
         completion_patch = patch(
             "trendradar.ai.client.completion", return_value=response

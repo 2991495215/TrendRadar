@@ -8,6 +8,7 @@ RSS 解析器
 import re
 import html
 import json
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional, Dict, Any
@@ -206,12 +207,40 @@ class RSSParser:
         """
         import requests
 
-        response = requests.get(url, timeout=timeout, headers={
-            "User-Agent": "TrendRadar/2.0 RSS Reader"
-        })
-        response.raise_for_status()
+        try:
+            response = requests.get(url, timeout=timeout, headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            })
+            response.raise_for_status()
+            content = response.text
+        except requests.RequestException:
+            # Some Cloudflare-protected feeds reject Python HTTP fingerprints
+            # while allowing the system curl client. Keep this fallback local to
+            # RSS fetching so the rest of TrendRadar still uses requests.
+            user_agent = (
+                "Mozilla/5.0 (compatible; Horizon/1.0)"
+                if "reddit.com/" in url
+                else "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+            result = subprocess.run(
+                [
+                    "curl", "--fail", "--silent", "--show-error", "--location",
+                    "--compressed",
+                    "--max-time", str(timeout),
+                    "--user-agent", user_agent,
+                    url,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            content = result.stdout
 
-        return self.parse(response.text, url)
+        return self.parse(content, url)
 
     def _parse_entry(self, entry: Any) -> Optional[ParsedRSSItem]:
         """解析单个条目"""

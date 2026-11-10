@@ -6,6 +6,7 @@ AI 翻译器模块
 基于 LiteLLM 统一接口，支持 100+ AI 提供商
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -95,8 +96,12 @@ class AITranslator:
 
             # 调用 AI API
             response = self._call_ai(user_prompt)
-            result.translated_text = response.strip()
-            result.success = True
+            translated = response.strip()
+            result.translated_text = translated
+            if self._is_valid_translation(text, translated):
+                result.success = True
+            else:
+                result.error = "AI 返回原文或未生成简体中文译文"
 
         except Exception as e:
             error_type = type(e).__name__
@@ -187,16 +192,22 @@ class AITranslator:
             translated_texts, raw_parsed_count = self._parse_batch_response(response, len(non_empty_texts))
             batch_result.parsed_count = raw_parsed_count
 
-            # 填充结果（跳过空翻译，避免用空字符串覆盖原始标题）
+            # 填充结果；批量漏译时单条补译，避免原文被误计为成功
             for idx, translated in zip(non_empty_indices, translated_texts):
-                if translated and translated.strip():
+                original = batch_result.results[idx].original_text
+                if self._is_valid_translation(original, translated):
                     batch_result.results[idx].translated_text = translated
                     batch_result.results[idx].success = True
                     batch_result.success_count += 1
                 else:
-                    batch_result.results[idx].translated_text = batch_result.results[idx].original_text
-                    batch_result.results[idx].success = True
-                    batch_result.success_count += 1
+                    retry_result = self.translate(original)
+                    if retry_result.success:
+                        batch_result.results[idx] = retry_result
+                        batch_result.success_count += 1
+                    else:
+                        batch_result.results[idx].translated_text = original
+                        batch_result.results[idx].error = retry_result.error or "批量翻译缺失，单条补译失败"
+                        batch_result.fail_count += 1
 
         except Exception as e:
             error_msg = f"批量翻译失败: {type(e).__name__}: {str(e)[:100]}"
@@ -205,6 +216,23 @@ class AITranslator:
             batch_result.fail_count = len(non_empty_indices)
 
         return batch_result
+
+    def _is_valid_translation(self, original: str, translated: str) -> bool:
+        """检查模型是否把需要翻译的英文标题真正转成中文。"""
+        if not translated or not translated.strip():
+            return False
+
+        target = self.target_language.lower()
+        is_chinese_target = any(marker in target for marker in ("中文", "简体", "chinese"))
+        if not is_chinese_target:
+            return True
+
+        # 品牌名或短型号可保持英文；完整英文句子必须含中文译文。
+        original_has_chinese = bool(re.search(r"[\u3400-\u9fff]", original))
+        latin_words = re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)?", original)
+        needs_chinese = not original_has_chinese and len(latin_words) >= 4
+        translated_has_chinese = bool(re.search(r"[\u3400-\u9fff]", translated))
+        return not needs_chinese or translated_has_chinese
 
     def _format_batch_content(self, texts: List[str]) -> str:
         """格式化批量翻译内容"""

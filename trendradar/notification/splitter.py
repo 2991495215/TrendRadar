@@ -6,6 +6,7 @@
 """
 
 from datetime import datetime
+from html import escape as html_escape
 from typing import Dict, List, Optional, Callable
 
 from trendradar.report.formatter import format_title_for_platform
@@ -205,7 +206,16 @@ def split_content_into_batches(
     
     # 累加 RSS 条目数
     if rss_items:
-        total_titles += sum(stat.get("count", 0) for stat in rss_items)
+        if format_type == "telegram":
+            rss_keys = set()
+            for stat in rss_items:
+                for item in stat.get("titles", []):
+                    url = item.get("mobile_url") or item.get("url") or ""
+                    key = url or f"{item.get('source_name', '')}\0{item.get('title', '').strip()}"
+                    rss_keys.add(key)
+            total_titles += len(rss_keys)
+        else:
+            total_titles += sum(stat.get("count", 0) for stat in rss_items)
 
     now = get_time_func() if get_time_func else datetime.now()
 
@@ -300,9 +310,15 @@ def split_content_into_batches(
         topics = " | ".join(f"{s['word']}({s['count']})" for s in top_words)
         base_header += f"{b_s}最热话题：{b_e} {topics}\n"
 
+    if format_type == "telegram":
+        base_header = (
+            f"📡 <b>前沿消息</b> · {total_titles} 条\n"
+            f"<code>{now.strftime('%m-%d %H:%M')}</code>\n"
+        )
+
     if format_type in ("feishu", "dingtalk"):
         base_header += "\n---\n\n"
-    else:
+    elif format_type != "telegram":
         base_header += "\n"
 
     base_footer = ""
@@ -311,9 +327,7 @@ def split_content_into_batches(
         if update_info:
             base_footer += f"\n> TrendRadar 发现新版本 **{update_info['remote_version']}**，当前 **{update_info['current_version']}**"
     elif format_type == "telegram":
-        base_footer = f"\n\n更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
-        if update_info:
-            base_footer += f"\nTrendRadar 发现新版本 {update_info['remote_version']}，当前 {update_info['current_version']}"
+        base_footer = ""
     elif format_type == "ntfy":
         base_footer = f"\n\n> 更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
         if update_info:
@@ -992,6 +1006,61 @@ def split_content_into_batches(
     return batches
 
 
+def _process_compact_telegram_rss_section(
+    rss_stats: list,
+    base_header: str,
+    base_footer: str,
+    max_bytes: int,
+    current_batch: str,
+    current_batch_has_content: bool,
+    batches: List[str],
+) -> tuple:
+    """Telegram RSS 主区块：全局去重、按 AI 相关度排序、无分类。"""
+    deduped = {}
+    order = 0
+    for stat in rss_stats:
+        for raw_item in stat.get("titles", []):
+            item = raw_item.copy()
+            url = item.get("mobile_url") or item.get("url") or ""
+            key = url or f"{item.get('source_name', '')}\0{item.get('title', '').strip()}"
+            try:
+                score = float(item.get("relevance_score", 0) or 0)
+            except (TypeError, ValueError):
+                score = 0.0
+            item["_score"] = score
+            item["_order"] = order
+            order += 1
+            previous = deduped.get(key)
+            if previous is None or score > previous["_score"]:
+                deduped[key] = item
+
+    items = sorted(deduped.values(), key=lambda x: (-x["_score"], x["_order"]))
+    for index, raw_item in enumerate(items, 1):
+        item = raw_item.copy()
+        item["is_new"] = False
+        formatted = format_title_for_platform("telegram", item, show_source=False)
+        formatted = formatted.split("\n<code>", 1)[0]
+        meta = [item.get("source_name", ""), item.get("time_display", "")]
+        meta = [html_escape(str(value)) for value in meta if value]
+        news_line = f"{index}. {formatted}"
+        if meta:
+            news_line += f"\n<code>{' · '.join(meta)}</code>"
+        news_line += "\n\n"
+
+        test_content = current_batch + news_line
+        if len(test_content.encode("utf-8")) + len(base_footer.encode("utf-8")) >= max_bytes:
+            if current_batch_has_content:
+                _safe_append_batch(batches, current_batch, base_footer, max_bytes, base_header)
+            current_batch = _safe_new_batch(
+                base_header + news_line, base_footer, max_bytes, base_header, batches
+            )
+        else:
+            current_batch = test_content
+        current_batch_has_content = True
+
+    return current_batch, current_batch_has_content, batches
+
+
 def _process_rss_stats_section(
     rss_stats: list,
     format_type: str,
@@ -1027,6 +1096,12 @@ def _process_rss_stats_section(
     if not rss_stats:
         return current_batch, current_batch_has_content, batches
 
+    if format_type == "telegram":
+        return _process_compact_telegram_rss_section(
+            rss_stats, base_header, base_footer, max_bytes,
+            current_batch, current_batch_has_content, batches,
+        )
+
     # 计算总条目数
     total_items = sum(stat["count"] for stat in rss_stats)
     total_keywords = len(rss_stats)
@@ -1042,7 +1117,7 @@ def _process_rss_stats_section(
         elif format_type in ("wework", "bark"):
             rss_header = f"\n\n\n\n📰 **RSS 订阅统计** (共 {total_items} 条)\n\n"
         elif format_type == "telegram":
-            rss_header = f"\n\n📰 RSS 订阅统计 (共 {total_items} 条)\n\n"
+            rss_header = f"\n\n🤖 <b>AI 精选</b> · {total_items} 条\n\n"
         elif format_type == "slack":
             rss_header = f"\n\n📰 *RSS 订阅统计* (共 {total_items} 条)\n\n"
         else:
@@ -1054,7 +1129,7 @@ def _process_rss_stats_section(
         elif format_type == "dingtalk":
             rss_header = f"📰 **RSS 订阅统计** (共 {total_items} 条)\n\n"
         elif format_type == "telegram":
-            rss_header = f"📰 RSS 订阅统计 (共 {total_items} 条)\n\n"
+            rss_header = f"🤖 <b>AI 精选</b> · {total_items} 条\n\n"
         elif format_type == "slack":
             rss_header = f"📰 *RSS 订阅统计* (共 {total_items} 条)\n\n"
         else:
@@ -1089,12 +1164,10 @@ def _process_rss_stats_section(
             else:
                 word_header = f"📌 {sequence_display} **{word}** : {count} 条\n\n"
         elif format_type == "telegram":
-            if count >= 10:
-                word_header = f"🔥 {sequence_display} {word} : {count} 条\n\n"
-            elif count >= 5:
-                word_header = f"📈 {sequence_display} {word} : {count} 条\n\n"
+            if total_keywords == 1:
+                word_header = ""
             else:
-                word_header = f"📌 {sequence_display} {word} : {count} 条\n\n"
+                word_header = f"🏷 <b>{word}</b> · {count} 条\n\n"
         elif format_type == "ntfy":
             if count >= 10:
                 word_header = f"🔥 {sequence_display} **{word}** : **{count}** 条\n\n"
@@ -1143,7 +1216,7 @@ def _process_rss_stats_section(
             else:
                 formatted_title = f"{first_title_data['title']}"
 
-            first_news_line = f"  1. {formatted_title}\n"
+            first_news_line = f"1. {formatted_title}\n"
             if len(stat["titles"]) > 1:
                 first_news_line += "\n"
 
@@ -1183,7 +1256,7 @@ def _process_rss_stats_section(
             else:
                 formatted_title = f"{title_data['title']}"
 
-            news_line = f"  {j + 1}. {formatted_title}\n"
+            news_line = f"{j + 1}. {formatted_title}\n"
             if j < len(stat["titles"]) - 1:
                 news_line += "\n"
 
@@ -1236,7 +1309,7 @@ def _process_rss_new_titles_section(
     timezone: str = DEFAULT_TIMEZONE,
     add_separator: bool = True,
 ) -> tuple:
-    """处理 RSS 新增区块（按来源分组，与热榜新增格式一致）
+    """处理 RSS 新增区块：全局去重并按 AI 相关度排序。
 
     Args:
         rss_new_stats: RSS 新增关键词统计列表，格式与热榜 stats 一致：
@@ -1258,161 +1331,76 @@ def _process_rss_new_titles_section(
     if not rss_new_stats:
         return current_batch, current_batch_has_content, batches
 
-    # 从关键词分组中提取所有条目，重新按来源分组
-    source_map = {}
+    deduped = {}
+    order = 0
     for stat in rss_new_stats:
-        for title_data in stat.get("titles", []):
-            source_name = title_data.get("source_name", "未知来源")
-            if source_name not in source_map:
-                source_map[source_name] = []
-            source_map[source_name].append(title_data)
+        for raw_item in stat.get("titles", []):
+            item = raw_item.copy()
+            url = item.get("mobile_url") or item.get("url") or ""
+            key = url or f"{item.get('source_name', '')}\0{item.get('title', '').strip()}"
+            try:
+                score = float(item.get("relevance_score", 0) or 0)
+            except (TypeError, ValueError):
+                score = 0.0
+            item["_score"] = score
+            item["_order"] = order
+            order += 1
+            previous = deduped.get(key)
+            if previous is None or score > previous["_score"]:
+                deduped[key] = item
 
-    if not source_map:
+    items = sorted(deduped.values(), key=lambda x: (-x["_score"], x["_order"]))
+    if not items:
         return current_batch, current_batch_has_content, batches
 
-    # 计算总条目数
-    total_items = sum(len(titles) for titles in source_map.values())
-
-    # RSS 新增区块标题（根据 add_separator 决定是否添加前置分割线）
-    new_header = ""
-    if add_separator and current_batch_has_content:
-        # 需要添加分割线
-        if format_type in ("wework", "bark"):
-            new_header = f"\n\n\n\n🆕 **RSS 本次新增** (共 {total_items} 条)\n\n"
-        elif format_type == "telegram":
-            new_header = f"\n\n🆕 RSS 本次新增 (共 {total_items} 条)\n\n"
-        elif format_type == "ntfy":
-            new_header = f"\n\n🆕 **RSS 本次新增** (共 {total_items} 条)\n\n"
-        elif format_type == "feishu":
-            new_header = f"\n{feishu_separator}\n\n🆕 **RSS 本次新增** (共 {total_items} 条)\n\n"
-        elif format_type == "dingtalk":
-            new_header = f"\n---\n\n🆕 **RSS 本次新增** (共 {total_items} 条)\n\n"
-        elif format_type == "slack":
-            new_header = f"\n\n🆕 *RSS 本次新增* (共 {total_items} 条)\n\n"
+    total_items = len(items)
+    prefix = "\n\n" if add_separator and current_batch_has_content else ""
+    if format_type == "telegram":
+        new_header = f"{prefix}📡 前沿消息 · {total_items}条\n"
+    elif format_type == "slack":
+        new_header = f"{prefix}*前沿消息 · {total_items}条*\n"
     else:
-        # 不需要分割线（第一个区域）
-        if format_type in ("wework", "bark"):
-            new_header = f"🆕 **RSS 本次新增** (共 {total_items} 条)\n\n"
-        elif format_type == "telegram":
-            new_header = f"🆕 RSS 本次新增 (共 {total_items} 条)\n\n"
-        elif format_type == "ntfy":
-            new_header = f"🆕 **RSS 本次新增** (共 {total_items} 条)\n\n"
-        elif format_type == "feishu":
-            new_header = f"🆕 **RSS 本次新增** (共 {total_items} 条)\n\n"
-        elif format_type == "dingtalk":
-            new_header = f"🆕 **RSS 本次新增** (共 {total_items} 条)\n\n"
-        elif format_type == "slack":
-            new_header = f"🆕 *RSS 本次新增* (共 {total_items} 条)\n\n"
+        new_header = f"{prefix}**前沿消息 · {total_items}条**\n"
 
-    # 添加 RSS 新增标题
     test_content = current_batch + new_header
     if len(test_content.encode("utf-8")) + len(base_footer.encode("utf-8")) >= max_bytes:
         if current_batch_has_content:
             _safe_append_batch(batches, current_batch, base_footer, max_bytes, base_header)
         current_batch = _safe_new_batch(
-            base_header + new_header, base_footer, max_bytes, base_header, batches
+            base_header + new_header.lstrip(), base_footer, max_bytes, base_header, batches
         )
-        current_batch_has_content = True
     else:
         current_batch = test_content
-        current_batch_has_content = True
+    current_batch_has_content = True
 
-    # 按来源分组显示（与热榜新增格式一致）
-    source_list = list(source_map.items())
-    for i, (source_name, titles) in enumerate(source_list):
-        count = len(titles)
+    for index, raw_item in enumerate(items, 1):
+        item = raw_item.copy()
+        item["is_new"] = False
+        if format_type == "telegram":
+            formatted = format_title_for_platform("telegram", item, show_source=False)
+            formatted = formatted.split("\n<code>", 1)[0]
+            meta = [item.get("source_name", ""), item.get("time_display", "")]
+            meta = [html_escape(str(value)) for value in meta if value]
+            news_line = f"{index}. {formatted}"
+            if meta:
+                news_line += f"\n<code>{' · '.join(meta)}</code>"
+            news_line += "\n\n"
+        else:
+            platform = "wework" if format_type == "bark" else format_type
+            formatted = format_title_for_platform(platform, item, show_source=True)
+            news_line = f"{index}. {formatted}\n"
 
-        # 构建来源标题（与热榜新增格式一致）
-        source_header = ""
-        if format_type in ("wework", "bark"):
-            source_header = f"**{source_name}** ({count} 条):\n\n"
-        elif format_type == "telegram":
-            source_header = f"{source_name} ({count} 条):\n\n"
-        elif format_type == "ntfy":
-            source_header = f"**{source_name}** ({count} 条):\n\n"
-        elif format_type == "feishu":
-            source_header = f"**{source_name}** ({count} 条):\n\n"
-        elif format_type == "dingtalk":
-            source_header = f"**{source_name}** ({count} 条):\n\n"
-        elif format_type == "slack":
-            source_header = f"*{source_name}* ({count} 条):\n\n"
-
-        # 构建第一条新闻（不显示来源，禁用 new emoji）
-        first_news_line = ""
-        if titles:
-            first_title_data = titles[0].copy()
-            first_title_data["is_new"] = False
-            if format_type in ("wework", "bark"):
-                formatted_title = format_title_for_platform("wework", first_title_data, show_source=False)
-            elif format_type == "telegram":
-                formatted_title = format_title_for_platform("telegram", first_title_data, show_source=False)
-            elif format_type == "ntfy":
-                formatted_title = format_title_for_platform("ntfy", first_title_data, show_source=False)
-            elif format_type == "feishu":
-                formatted_title = format_title_for_platform("feishu", first_title_data, show_source=False)
-            elif format_type == "dingtalk":
-                formatted_title = format_title_for_platform("dingtalk", first_title_data, show_source=False)
-            elif format_type == "slack":
-                formatted_title = format_title_for_platform("slack", first_title_data, show_source=False)
-            else:
-                formatted_title = f"{first_title_data['title']}"
-
-            first_news_line = f"  1. {formatted_title}\n"
-
-        # 原子性检查：来源标题 + 第一条新闻必须一起处理
-        source_with_first_news = source_header + first_news_line
-        test_content = current_batch + source_with_first_news
-
+        test_content = current_batch + news_line
         if len(test_content.encode("utf-8")) + len(base_footer.encode("utf-8")) >= max_bytes:
             if current_batch_has_content:
                 _safe_append_batch(batches, current_batch, base_footer, max_bytes, base_header)
             current_batch = _safe_new_batch(
-                base_header + new_header + source_with_first_news,
+                base_header + new_header.lstrip() + news_line,
                 base_footer, max_bytes, base_header, batches
             )
-            current_batch_has_content = True
-            start_index = 1
         else:
             current_batch = test_content
-            current_batch_has_content = True
-            start_index = 1
-
-        # 处理剩余新闻条目（禁用 new emoji）
-        for j in range(start_index, len(titles)):
-            title_data = titles[j].copy()
-            title_data["is_new"] = False
-            if format_type in ("wework", "bark"):
-                formatted_title = format_title_for_platform("wework", title_data, show_source=False)
-            elif format_type == "telegram":
-                formatted_title = format_title_for_platform("telegram", title_data, show_source=False)
-            elif format_type == "ntfy":
-                formatted_title = format_title_for_platform("ntfy", title_data, show_source=False)
-            elif format_type == "feishu":
-                formatted_title = format_title_for_platform("feishu", title_data, show_source=False)
-            elif format_type == "dingtalk":
-                formatted_title = format_title_for_platform("dingtalk", title_data, show_source=False)
-            elif format_type == "slack":
-                formatted_title = format_title_for_platform("slack", title_data, show_source=False)
-            else:
-                formatted_title = f"{title_data['title']}"
-
-            news_line = f"  {j + 1}. {formatted_title}\n"
-
-            test_content = current_batch + news_line
-            if len(test_content.encode("utf-8")) + len(base_footer.encode("utf-8")) >= max_bytes:
-                if current_batch_has_content:
-                    _safe_append_batch(batches, current_batch, base_footer, max_bytes, base_header)
-                current_batch = _safe_new_batch(
-                    base_header + new_header + source_header + news_line,
-                    base_footer, max_bytes, base_header, batches
-                )
-                current_batch_has_content = True
-            else:
-                current_batch = test_content
-                current_batch_has_content = True
-
-        # 来源间添加空行（与热榜新增格式一致）
-        current_batch += "\n"
+        current_batch_has_content = True
 
     return current_batch, current_batch_has_content, batches
 

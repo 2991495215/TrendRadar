@@ -23,6 +23,7 @@ from trendradar.ai import AIAnalyzer, AIAnalysisResult
 from trendradar.core.scheduler import ResolvedSchedule
 from trendradar.commands import check_all_versions, run_doctor, run_test_notification, handle_status_commands
 from trendradar.commands.version import _fetch_remote_version, _parse_version
+from trendradar.notification import send_to_telegram
 
 
 
@@ -456,8 +457,12 @@ class NewsAnalyzer:
             )
 
             if not all_results:
-                print("没有找到当天的数据")
-                return None
+                if self.ctx.rss_enabled:
+                    if not quiet:
+                        print("[RSS-only] no hotlist data; continue with RSS data")
+                else:
+                    print("没有找到当天的数据")
+                    return None
 
             total_titles = sum(len(titles) for titles in all_results.values())
             if not quiet:
@@ -689,14 +694,9 @@ class NewsAnalyzer:
                 rss_items = ai_rss_stats
                 rss_new_items = ai_rss_new_stats
             else:
-                # AI 筛选失败，回退到关键词匹配
+                # AI 失败时终止本轮，未分析数据下轮重试，禁止绕过评分。
                 error_msg = ai_filter_result.error if ai_filter_result else "未知错误"
-                print(f"[筛选] AI 筛选失败: {error_msg}，回退到关键词匹配")
-                stats, total_titles = self.ctx.count_frequency(
-                    data_source, word_groups, filter_words,
-                    id_to_name, title_info, new_titles,
-                    mode=mode, global_filters=global_filters, quiet=quiet,
-                )
+                raise RuntimeError(f"[筛选] AI 筛选失败: {error_msg}，暂停本轮推送，等待下轮重试")
         else:
             # === 关键词匹配策略（默认）===
             stats, total_titles = self.ctx.count_frequency(
@@ -804,10 +804,52 @@ class NewsAnalyzer:
         ai_result: Optional[AIAnalysisResult] = None,
         current_results: Optional[Dict] = None,
         schedule: ResolvedSchedule = None,
+        raw_rss_items: Optional[List[Dict]] = None,
     ) -> bool:
         """统一的通知发送逻辑，包含所有判断条件，支持热榜+RSS合并推送+AI分析+独立展示区"""
         has_notification = self._has_notification_configured()
         cfg = self.ctx.config
+
+        # Separate full RSS channel: every newly discovered RSS item bypasses
+        # keyword and AI filtering. The normal Zane notification path is unchanged.
+        full_token = os.environ.get("TELEGRAM_FULL_BOT_TOKEN", "").strip()
+        full_chat_id = os.environ.get("TELEGRAM_FULL_CHAT_ID", "").strip()
+        if full_token and full_chat_id and raw_rss_items and schedule and schedule.push:
+            full_data = {"platforms": [], "rss_feeds": []}
+            feed_order = [f.get("id", "") for f in self.ctx.rss_feeds]
+            by_feed = {}
+            for item in raw_rss_items:
+                feed_id = item.get("feed_id", "")
+                if not feed_id:
+                    continue
+                by_feed.setdefault(feed_id, {"id": feed_id, "name": item.get("feed_name", feed_id), "items": []})
+                by_feed[feed_id]["items"].append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "published_at": item.get("published_at", ""),
+                    "author": item.get("author", ""),
+                })
+            full_data["rss_feeds"] = [by_feed[k] for k in feed_order if k in by_feed]
+            if not full_data["rss_feeds"]:
+                full_data["rss_feeds"] = list(by_feed.values())
+            try:
+                full_ok = send_to_telegram(
+                    bot_token=full_token,
+                    chat_id=full_chat_id,
+                    report_data={"stats": [], "failed_ids": [], "new_titles": [], "id_to_name": {}},
+                    report_type="全量RSS",
+                    mode="incremental",
+                    account_label="全量",
+                    batch_size=cfg.get("MESSAGE_BATCH_SIZE", 4000),
+                    batch_interval=cfg.get("BATCH_SEND_INTERVAL", 1.0),
+                    split_content_func=self.ctx.split_content,
+                    ai_analysis=None,
+                    display_regions={"HOTLIST": False, "RSS": False, "NEW_ITEMS": False, "STANDALONE": True, "AI_ANALYSIS": False},
+                    standalone_data=full_data,
+                )
+                print(f"[全量RSS] 新增 {len(raw_rss_items)} 条，发送{'成功' if full_ok else '失败'}")
+            except Exception as e:
+                print(f"[全量RSS] 发送出错: {e}")
 
         # 检查是否有有效内容（热榜或RSS）
         has_news_content = self._has_valid_content(stats, new_titles)
@@ -892,6 +934,13 @@ class NewsAnalyzer:
                 return False
 
             # 记录推送成功
+            if results.get("telegram"):
+                from trendradar.ai import forum_stream
+                if forum_stream.enabled():
+                    forum_stream.mark_sent([
+                        t["queue_id"] for group in (rss_items or [])
+                        for t in group.get("titles", []) if t.get("queue_id")
+                    ])
             if any(results.values()):
                 if schedule.once_push and schedule.period_key:
                     scheduler = self.ctx.create_scheduler()
@@ -927,8 +976,8 @@ class NewsAnalyzer:
         now = self.ctx.get_time()
         print(f"当前北京时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        if not self.ctx.config["ENABLE_CRAWLER"]:
-            print("爬虫功能已禁用（ENABLE_CRAWLER=False），程序退出")
+        if not self.ctx.config["ENABLE_CRAWLER"] and not self.ctx.config.get("RSS", {}).get("ENABLED", False):
+            print("热榜和 RSS 均已关闭，跳过采集")
             return False
 
         has_notification = self._has_notification_configured()
@@ -963,9 +1012,12 @@ class NewsAnalyzer:
         print(f"开始爬取数据，请求间隔 {self.request_interval} 毫秒")
         Path("output").mkdir(parents=True, exist_ok=True)
 
-        results, id_to_name, failed_ids = self.data_fetcher.crawl_websites(
-            ids, self.request_interval, domain_rules=domain_rules
-        )
+        if self.ctx.config["ENABLE_CRAWLER"]:
+            results, id_to_name, failed_ids = self.data_fetcher.crawl_websites(
+                ids, self.request_interval, domain_rules=domain_rules
+            )
+        else:
+            results, id_to_name, failed_ids = {}, {}, []
 
         # 转换为 NewsData 格式并保存到存储后端
         crawl_time = self.ctx.format_time()
@@ -1131,7 +1183,7 @@ class NewsAnalyzer:
         if self.report_mode == "incremental":
             new_items_dict = self.storage_manager.detect_new_rss_items(rss_data)
             if new_items_dict:
-                raw_rss_items = self._convert_rss_items_to_list(new_items_dict, rss_data.id_to_name)
+                raw_rss_items = self._convert_rss_items_to_list(new_items_dict, rss_data.id_to_name, apply_freshness=False)
         elif self.report_mode == "current":
             latest_data = self.storage_manager.get_latest_rss_data(rss_data.date)
             if latest_data:
@@ -1260,8 +1312,8 @@ class NewsAnalyzer:
         self._rss_total_count = total
         return rss_stats, rss_new_stats, raw_rss_items, rss_new_urls
 
-    def _convert_rss_items_to_list(self, items_dict: Dict, id_to_name: Dict) -> List[Dict]:
-        """将 RSS 条目字典转换为列表格式，并应用新鲜度过滤（用于推送）"""
+    def _convert_rss_items_to_list(self, items_dict: Dict, id_to_name: Dict, apply_freshness: bool = True) -> List[Dict]:
+        """将 RSS 条目字典转换为列表；全量通道可跳过新鲜度过滤。"""
         rss_items = []
         filtered_count = 0
         filtered_details = []  # 用于 DEBUG 模式下的详细日志
@@ -1293,7 +1345,7 @@ class NewsAnalyzer:
 
             for item in items:
                 # 应用新鲜度过滤（仅在启用时）
-                if freshness_enabled and max_days > 0:
+                if apply_freshness and freshness_enabled and max_days > 0:
                     if item.published_at and not is_within_days(item.published_at, max_days, timezone):
                         filtered_count += 1
                         # 记录详细信息用于 DEBUG 模式
@@ -1317,6 +1369,23 @@ class NewsAnalyzer:
                     "summary": item.summary,
                     "author": item.author,
                 })
+
+        # 同一内容可能同时出现在多个 RSS 源（例如 X 的“为你推荐”和“正在关注）。
+        # 存储层按 feed_id 隔离去重，因此在统一列表阶段再按 URL 合并，避免重复推送。
+        deduped_items = []
+        seen_urls = set()
+        duplicate_count = 0
+        for item in rss_items:
+            url = str(item.get("url", "") or "").strip()
+            if url and url in seen_urls:
+                duplicate_count += 1
+                continue
+            if url:
+                seen_urls.add(url)
+            deduped_items.append(item)
+        rss_items = deduped_items
+        if duplicate_count > 0:
+            print(f"[RSS] 跨源去重：合并 {duplicate_count} 条重复 URL")
 
         # 输出过滤统计
         if filtered_count > 0:
@@ -1594,6 +1663,7 @@ class NewsAnalyzer:
                 ai_result=ai_result,
                 current_results=results,
                 schedule=schedule,
+                raw_rss_items=raw_rss_items,
             )
 
         # 打开浏览器（仅在非容器环境）

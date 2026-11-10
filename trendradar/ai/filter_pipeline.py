@@ -73,6 +73,9 @@ class AIFilterPipeline:
         6. 查询 active 结果，按标签分组返回
         """
         filter_config = self._filter_config
+        from trendradar.ai import forum_stream
+        if forum_stream.enabled():
+            return forum_stream.hourly_result(config=self.config)
 
         ai_filter = AIFilter(self._ai_config, filter_config, self.get_time, self._debug)
 
@@ -156,6 +159,11 @@ class AIFilterPipeline:
 
         # 8. 查询并组装返回结果
         all_results = self.storage.get_active_ai_filter_results(interests_file=effective_interests_file)
+        # 本轮成功分类包括先前失败后重试的条目，允许增量报告补推。
+        classified_now = {("hotlist", i) for i in succeeded_news_ids}
+        classified_now.update(("rss", i) for i in succeeded_rss_ids)
+        for result in all_results:
+            result["classified_now"] = (result.get("source_type"), result.get("news_item_id")) in classified_now
 
         if self._debug:
             print(f"[AI筛选][DEBUG] === 最终汇总 ===")
@@ -328,7 +336,14 @@ class AIFilterPipeline:
                 time.sleep(batch_interval)
             batch = pending_news[i:i + batch_size]
             titles_for_ai = [
-                {"id": n["id"], "title": n["title"], "source": n.get("source_name", "")}
+                {
+                    "id": n["id"],
+                    "title": n["title"],
+                    "source": n.get("source_name", ""),
+                    "summary": n.get("summary", "")[:500],
+                    "url": n.get("url", ""),
+                    "author": n.get("author", ""),
+                }
                 for n in batch
             ]
             batch_results = ai_filter.classify_batch(titles_for_ai, active_tags, interests_content)
@@ -350,7 +365,14 @@ class AIFilterPipeline:
                 time.sleep(batch_interval)
             batch = pending_rss[i:i + batch_size]
             titles_for_ai = [
-                {"id": n["id"], "title": n["title"], "source": n.get("source_name", "")}
+                {
+                    "id": n["id"],
+                    "title": n["title"],
+                    "source": n.get("source_name", ""),
+                    "summary": n.get("summary", "")[:500],
+                    "url": n.get("url", ""),
+                    "author": n.get("author", ""),
+                }
                 for n in batch
             ]
             batch_results = ai_filter.classify_batch(titles_for_ai, active_tags, interests_content)
@@ -447,6 +469,7 @@ class AIFilterPipeline:
                 "count": r.get("count", 1),
                 "relevance_score": r.get("relevance_score", 0),
                 "source_type": r.get("source_type", "hotlist"),
+                "classified_now": r.get("classified_now", False),
             })
             tag_groups[tag_name]["count"] += 1
 
@@ -500,6 +523,7 @@ class AIFilterPipeline:
                 print(f"[AI筛选] current 模式：最新时间 {latest_time}，过滤已下榜新闻")
 
         filtered_count = 0
+        seen_rss_urls = set()
         for tag_data in ai_filter_result.tags:
             tag_name = tag_data.get("tag", "")
             items = tag_data.get("items", [])
@@ -525,7 +549,7 @@ class AIFilterPipeline:
                 first_time = item.get("first_time", "")
                 last_time = item.get("last_time", "")
                 if source_type == "rss":
-                    if self._freshness_enabled and first_time:
+                    if self._freshness_enabled and first_time and not item.get("queue_id"):
                         feed_id = item.get("source_id", "")
                         max_days = self._feed_max_age_map.get(feed_id, self._default_max_age_days)
                         if max_days > 0 and not is_within_days(first_time, max_days, self._timezone):
@@ -554,12 +578,25 @@ class AIFilterPipeline:
                         if item_source_id in new_titles:
                             is_new = item_title in new_titles[item_source_id]
 
+                is_new = is_new or item.get("classified_now", False)
+
                 if mode == "incremental" and not is_new:
                     continue
 
+                # AI 结果可能同时包含同一 URL 的多个 feed 记录或多个标签命中；
+                # 推送层只保留一条 RSS 内容，避免同一帖子重复发送。
+                if source_type == "rss":
+                    item_url = str(item.get("url", "") or "").strip()
+                    if item_url and item_url in seen_rss_urls:
+                        continue
+                    if item_url:
+                        seen_rss_urls.add(item_url)
+
                 title_entry = {
+                    "queue_id": item.get("queue_id"),
                     "title": item.get("title", ""),
                     "source_name": item.get("source_name", ""),
+                    "source_id": item.get("source_id", ""),
                     "url": item.get("url", ""),
                     "mobile_url": item.get("mobile_url", ""),
                     "ranks": item.get("ranks", []),
@@ -568,6 +605,7 @@ class AIFilterPipeline:
                     "is_new": is_new,
                     "time_display": time_display,
                     "matched_keyword": tag_name,
+                    "relevance_score": item.get("relevance_score", 0),
                 }
 
                 if source_type == "rss":
@@ -586,7 +624,7 @@ class AIFilterPipeline:
                 })
 
             if rss_titles:
-                if self._max_news > 0:
+                if self._max_news > 0 and not any(t.get("queue_id") for t in rss_titles):
                     rss_titles = rss_titles[:self._max_news]
                 rss_stats.append({
                     "word": tag_name,
@@ -615,7 +653,6 @@ class AIFilterPipeline:
             if rss_kept > 0:
                 parts.append(f"RSS {rss_kept} 条")
             print(f"[AI筛选] 分数过滤：min_score={min_score}，保留 {total_kept} 条 score≥{min_score} ({', '.join(parts)})")
-
         sort_key_priority = lambda x: (x.get("position", 9999), -x["count"], x["word"])
         sort_key_count = lambda x: (-x["count"], x.get("position", 9999), x["word"])
         sort_key = sort_key_priority if self._priority_sort_enabled else sort_key_count

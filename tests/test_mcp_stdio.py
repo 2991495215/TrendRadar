@@ -53,6 +53,7 @@ def stdio_roundtrip(source_root, keywords=KEYWORDS):
             PYTHONNOUSERSITE="1",
             USERPROFILE=str(project_root),
             LITELLM_LOCAL_MODEL_COST_MAP="True",
+            FASTMCP_CHECK_FOR_UPDATES="off",
         )
         process = subprocess.Popen(
             [sys.executable, "-B", "-u", "-m", "mcp_server.server",
