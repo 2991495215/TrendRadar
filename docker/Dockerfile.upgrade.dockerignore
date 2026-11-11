@@ -1,0 +1,15 @@
+*
+!pyproject.toml
+!uv.lock
+!trendradar/
+!trendradar/**
+!mcp_server/
+!mcp_server/**
+!tests/
+!tests/**
+!full_rss_push.py
+!docker/
+!docker/Dockerfile.upgrade
+**/__pycache__/
+**/*.pyc
+**/*.bak*

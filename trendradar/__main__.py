@@ -1194,7 +1194,10 @@ class NewsAnalyzer:
                 raw_rss_items = self._convert_rss_items_to_list(all_data.items, all_data.id_to_name)
 
         # 统计本模式的新鲜度过滤后条目数，不依赖展示开关或关键词匹配结果
-        self._rss_total_count = len(raw_rss_items or [])
+        counted_items = raw_rss_items or []
+        if self.report_mode == "incremental" and new_items_dict:
+            counted_items = self._convert_rss_items_to_list(new_items_dict, rss_data.id_to_name)
+        self._rss_total_count = len(counted_items)
 
         # 如果 RSS 展示未启用，跳过关键词分析，只返回原始条目用于独立展示区
         if not rss_display_enabled:

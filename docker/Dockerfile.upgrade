@@ -1,0 +1,14 @@
+ARG BASE_IMAGE=security-event/trendradar:20261025
+FROM ${BASE_IMAGE}
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-install-project --no-dev --no-cache
+COPY trendradar/ ./trendradar/
+COPY mcp_server/ ./mcp_server/
+COPY full_rss_push.py ./full_rss_push.py
+COPY tests/ ./tests/
+ENV LITELLM_LOCAL_MODEL_COST_MAP=True FASTMCP_CHECK_FOR_UPDATES=off
+RUN uv run --no-sync --with pytest python -m pytest tests -q
+RUN TELEGRAM_FULL_BOT_TOKEN=offline TELEGRAM_FULL_CHAT_ID=offline python -c "import full_rss_push,trendradar.ai.forum_stream; print('imports ok')"
+RUN python -c "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'; c=sqlite3.connect(':memory:'); c.execute('CREATE VIRTUAL TABLE f USING fts5(text)')"
+LABEL org.opencontainers.image.version="6.11.0"

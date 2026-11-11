@@ -125,7 +125,8 @@ class RssTotalCountTests(unittest.TestCase):
                     analyzer.ctx.rss_config["FRESHNESS_FILTER"]["ENABLED"] = True
                     _, _, raw_items, _ = analyzer._process_rss_data_by_mode(self.rss_data)
 
-                    self.assertEqual(len(raw_items), expected - 1)
+                    # The full RSS channel retains old discoveries; report totals still apply freshness.
+                    self.assertEqual(len(raw_items), expected if mode == "incremental" else expected - 1)
                     self.assertEqual(analyzer._rss_total_count, expected - 1)
 
 
